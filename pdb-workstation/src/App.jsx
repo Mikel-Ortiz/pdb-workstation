@@ -36,15 +36,15 @@ const SOLVENTS = new Set([
 ]);
 const TOOLS = [
   { id:"dogsite", name:"DoGSiteScorer", badge:"DOG", col:"#38bdf8",
-    url: id=>`https://proteins.plus/pages/dogsite#${id}`,
-    hint:"Ingresa el PDB ID directo. D-score ≥ 0.5 = druggable.",
+    url: id=>`https://proteins.plus/${id.toLowerCase()}`,
+    hint:"El enlace abre tu estructura en ProteinsPlus. Selecciona DoGSiteScorer. D-score ≥ 0.5 = druggable.",
     fields:[{k:"score",l:"D-Score",s:true},{k:"vol",l:"Vol Å³"},{k:"depth",l:"Prof Å"},{k:"hydro",l:"Hidrofob"}] },
   { id:"fpocket", name:"FPocketWeb", badge:"FPW", col:"#34d399",
-    url: ()=>"https://fpocketweb.rpbs.univ-paris-diderot.fr/",
-    hint:"Sube el PDB limpio. Drug_score ≥ 0.5 = druggable.",
+    url: ()=>"https://durrantlab.com/fpocketweb/",
+    hint:"Corre en tu navegador (sin subir datos). Sube el PDB limpio de la pestaña Descarga. Drug_score ≥ 0.5 = druggable.",
     fields:[{k:"score",l:"Drug Score",s:true},{k:"vol",l:"Vol Å³"},{k:"polarity",l:"Polaridad"},{k:"nres",l:"# Res"}] },
   { id:"castp", name:"CASTp 3.0", badge:"CSP", col:"#fbbf24",
-    url: id=>`https://sts.bioe.uic.edu/castp/index.php?pdbId=${id}`,
+    url: id=>`https://sts.bioe.uic.edu/castp/index.html?${id.toLowerCase()}`,
     hint:"Topografía superficial. MS Vol > 500 Å³ = bolsillo amplio.",
     fields:[{k:"saArea",l:"SA Área"},{k:"saVol",l:"SA Vol"},{k:"msArea",l:"MS Área"},{k:"msVol",l:"MS Vol"}] },
 ];
