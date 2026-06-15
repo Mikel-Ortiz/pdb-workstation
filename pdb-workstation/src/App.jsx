@@ -76,16 +76,16 @@ const buildTextQuery = (text, f) => {
   return {query:q, return_type:"entry", request_options:opts};
 };
 
-const buildUniprotQuery = acc => ({
-  query: {
-    type:"group", logical_operator:"and", nodes:[
-      {type:"terminal",service:"text",parameters:{attribute:"rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",operator:"exact_match",value:acc.trim().toUpperCase()}},
-      {type:"terminal",service:"text",parameters:{attribute:"rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",operator:"exact_match",value:"UniProt"}},
-    ]
-  },
-  return_type:"entry",
-  request_options:{paginate:{start:0,rows:25},sort:[{sort_by:"rcsb_accession_info.initial_release_date",direction:"descending"}]},
-});
+const buildUniProtQuery = (uniprotId, f) => {
+  const nodes = [
+    {type:"terminal",service:"text",parameters:{attribute:"rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",operator:"exact_match",value:uniprotId.trim().toUpperCase()}},
+    {type:"terminal",service:"text",parameters:{attribute:"rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",operator:"exact_match",value:"UniProt"}},
+  ];
+  if (f.maxRes)        nodes.push({type:"terminal",service:"text",parameters:{attribute:"rcsb_entry_info.resolution_combined",operator:"less_or_equal",value:parseFloat(f.maxRes)}});
+  if (f.method)        nodes.push({type:"terminal",service:"text",parameters:{attribute:"exptl.method",operator:"exact_match",value:f.method}});
+  if (f.ligand.trim()) nodes.push({type:"terminal",service:"text",parameters:{attribute:"rcsb_nonpolymer_entity_container_identifiers.comp_id",operator:"exact_match",value:f.ligand.trim().toUpperCase()}});
+  return {query:{type:"group",logical_operator:"and",nodes},return_type:"polymer_entity",request_options:{paginate:{start:0,rows:25}}};
+};
 
 const fetchDetails = async ids => {
   const list = await Promise.all(ids.map(async id => {
@@ -402,7 +402,7 @@ export default function App() {
       const r=await fetch(url);
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
       const j=await r.json();
-      const ids=(j.result_set||[]).map(x=>x.identifier);
+      const ids = [...new Set((j.result_set||[]).map(x=>x.identifier.split("_")[0]))];
       if(!ids.length){setError("Sin resultados. Prueba términos más generales.");return;}
       const det=await fetchDetails(ids);
       setResults(ids.map(id=>det[id]||{rcsb_id:id}));
