@@ -117,6 +117,150 @@ const fetchDetails = async ids => {
 };
 
 /* ═══════════════════════════════════════════════════════════
+   VALIDACIÓN CRISTALOGRÁFICA (PDBe + RCSB)
+   Basado en: Warren et al. 2012 (Iridium), Deller & Rupp 2015.
+   La resolución es CANTIDAD, no calidad. Los criterios decisivos son
+   R-free, error de coordenadas, y el ajuste local del ligando (RSCC/RSR).
+═══════════════════════════════════════════════════════════ */
+const PDBE = "https://www.ebi.ac.uk/pdbe/api";
+
+// Promise con timeout para que un endpoint lento no congele la app
+const fetchJSON = async (url, ms=12000) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, {signal:ctrl.signal});
+    clearTimeout(t);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { clearTimeout(t); return null; }
+};
+
+/* Nivel 1 — Calidad global del modelo (R-free, R-work, resolución, factores de estructura) */
+const fetchGlobalQuality = async id => {
+  const lid = id.toLowerCase();
+  const out = {rfree:null, rwork:null, resolution:null, hasSF:null, pctRfree:null, pctClash:null};
+  // Estadísticas de refinamiento (R-free, R-work, resolución)
+  const stats = await fetchJSON(`${PDBE}/validation/xray_refine_data_stats/entry/${lid}`);
+  const s = stats?.[lid]?.[0];
+  if (s) {
+    out.rfree      = s.R_free!=null ? parseFloat(s.R_free) : null;
+    out.rwork      = s.R_work!=null ? parseFloat(s.R_work) : (s.R_factor!=null?parseFloat(s.R_factor):null);
+    out.resolution = s.resolution!=null ? parseFloat(s.resolution) : null;
+  }
+  // Percentiles globales (calidad relativa al archivo)
+  const glob = await fetchJSON(`${PDBE}/validation/global-percentiles/entry/${lid}`);
+  const g = glob?.[lid];
+  if (g) {
+    out.pctRfree = g.percentiles?.Rfree ?? g.Rfree ?? null;
+    out.pctClash = g.percentiles?.clashscore ?? g.clashscore ?? null;
+  }
+  // ¿Hay factores de estructura? (RCSB entry endpoint)
+  const ent = await fetchJSON(`https://data.rcsb.org/rest/v1/core/entry/${id}`);
+  if (ent) {
+    const sf = ent?.rcsb_entry_info?.experimental_method_details
+            ?? ent?.pdbx_database_status?.status_code_sf;
+    out.hasSF = ent?.rcsb_entry_info?.diffrn_resolution_high?.value!=null
+              || ent?.pdbx_database_status?.status_code_sf==="REL"
+              || null;
+    if (out.resolution==null) out.resolution = ent?.rcsb_entry_info?.resolution_combined?.[0] ?? null;
+  }
+  return out;
+};
+
+/* Nivel 2 — Calidad local del ligando co-cristalizado (RSCC, RSR, geometría)
+   Endpoint de outliers: marca ligandos con RSR>0.4 o RSCC<0.8 (criterio wwPDB actual). */
+const fetchLigandQuality = async (id, ligCode) => {
+  const lid = id.toLowerCase();
+  const out = {rscc:null, rsr:null, flagged:false, hasData:false, geomOutliers:0};
+  // El endpoint key_validation_stats / outliers trae density-fit por residuo
+  const data = await fetchJSON(`${PDBE}/validation/protein-RNA-DNA-geometry-outlier-residues/entry/${lid}`);
+  // Density fit de ligandos
+  const dens = await fetchJSON(`${PDBE}/validation/RNA_pucker_suite_outliers/entry/${lid}`); // fallback dummy
+  // Endpoint principal de outliers de todos los tipos:
+  const all = await fetchJSON(`${PDBE}/validation/outliers/all/${lid}`);
+  if (all?.[lid]) {
+    out.hasData = true;
+    const mols = all[lid].molecules || [];
+    for (const mol of mols) {
+      for (const ch of (mol.chains||[])) {
+        for (const res of (ch.models?.[0]?.residues || ch.residues || [])) {
+          if (res.residue_name===ligCode || res.chem_comp_id===ligCode) {
+            // density-fit outliers traen RSCC/RSR cuando existen
+            const ol = res.outlier_types || [];
+            if (res.RSCC!=null) out.rscc = parseFloat(res.RSCC);
+            if (res.RSR!=null)  out.rsr  = parseFloat(res.RSR);
+            out.geomOutliers += (res.geometry_outlier_count ?? ol.filter(t=>/bond|angle|chir|clash/i.test(t)).length);
+            if (ol.some(t=>/density|RSRZ|RSCC/i.test(t))) out.flagged = true;
+          }
+        }
+      }
+    }
+  }
+  // Fallback: score de calidad de ligando del RCSB (PC1-fitting, agregado RSR+RSCC)
+  if (out.rscc==null) {
+    const lq = await fetchJSON(`https://data.rcsb.org/rest/v1/core/nonpolymer_entity_instance/${id}/A`);
+    const val = lq?.rcsb_nonpolymer_instance_validation_score?.[0];
+    if (val) {
+      out.hasData = true;
+      if (val.RSCC!=null) out.rscc = parseFloat(val.RSCC);
+      if (val.RSR!=null)  out.rsr  = parseFloat(val.RSR);
+      if (val.is_subject_of_investigation!=null) {} // info extra
+      out.ranking = val.ranking_model_fit ?? null;
+    }
+  }
+  // Bandera según criterio wwPDB actual: RSR>0.4 o RSCC<0.8
+  if (out.rsr!=null && out.rsr>0.4) out.flagged = true;
+  if (out.rscc!=null && out.rscc<0.8) out.flagged = true;
+  return out;
+};
+
+/* Veredicto combinado jerárquico.
+   Una estructura NO puede ser "óptima" si falla Nivel 1 (datos no confiables)
+   o Nivel 2 (RSCC<0.8). El CNN score (Nivel 3) confirma, no rescata. */
+const receptorVerdict = (q, lig, gnina) => {
+  // q: global quality, lig: ligand quality, gnina: {cnn, rmsd}
+  const flags = [];
+  let tier = "ok"; // ok | caution | reject | unknown
+
+  // Nivel 1
+  if (q) {
+    if (q.rfree!=null && q.rwork!=null && (q.rfree - q.rwork) > 0.05)
+      flags.push({lvl:"R-free − R-work > 0.05 (sobreajuste)", sev:"caution"});
+    if (q.rfree!=null && q.rfree > 0.45)
+      flags.push({lvl:"R-free > 0.45", sev:"reject"});
+    if (q.rfree!=null && q.rfree > 0.28 && q.rfree <= 0.45)
+      flags.push({lvl:"R-free elevado", sev:"caution"});
+  }
+  // Nivel 2 — lo más decisivo para docking
+  if (lig && lig.hasData) {
+    if (lig.rscc!=null && lig.rscc < 0.8)
+      flags.push({lvl:`RSCC del ligando ${lig.rscc.toFixed(2)} < 0.8 (mal soportado)`, sev:"reject"});
+    else if (lig.rscc!=null && lig.rscc < 0.9)
+      flags.push({lvl:`RSCC del ligando ${lig.rscc.toFixed(2)} (dudoso)`, sev:"caution"});
+    if (lig.rsr!=null && lig.rsr > 0.4)
+      flags.push({lvl:`RSR del ligando ${lig.rsr.toFixed(2)} > 0.4`, sev:"caution"});
+  }
+  // Determinar tier por la peor bandera
+  if (flags.some(f=>f.sev==="reject")) tier = "reject";
+  else if (flags.some(f=>f.sev==="caution")) tier = "caution";
+  else if ((q && q.rfree!=null) || (lig && lig.hasData)) tier = "ok";
+  else tier = "unknown";
+
+  // Nivel 3 confirma (no rescata)
+  let cnnNote = null;
+  if (gnina && gnina.cnn!=null) {
+    if (gnina.cnn >= 0.9) cnnNote = "CNN ≥ 0.9: receptor de alta calidad para docking";
+    else if (gnina.cnn >= 0.5) cnnNote = "CNN 0.5–0.9: aceptable con precaución";
+    else cnnNote = "CNN < 0.5: sitio probablemente ocluido";
+  }
+  return {tier, flags, cnnNote};
+};
+
+const tierColor = t => t==="ok"?"#34d399":t==="caution"?"#fbbf24":t==="reject"?"#f87171":"#4a6a8a";
+const tierLabel = t => t==="ok"?"Apto":t==="caution"?"Precaución":t==="reject"?"No recomendado":"Sin datos";
+
+/* ═══════════════════════════════════════════════════════════
    PROCESAMIENTO PDB
 ═══════════════════════════════════════════════════════════ */
 const PDB = {
@@ -358,6 +502,11 @@ export default function App() {
   const [zipLoad,setZipLoad]     = useState({});
   const [interTarget,setInterTarget] = useState("");
   const [interLig,setInterLig]   = useState("");
+  // Validación cristalográfica (Nivel 1+2) y GNINA (Nivel 3)
+  const [valData,setValData]     = useState({});   // {id:{global, ligand}}
+  const [valLoad,setValLoad]     = useState({});   // {id:bool}
+  const [gnina,setGnina]         = useState({});   // {id:{cnn, rmsd}}
+  const [valLigSel,setValLigSel] = useState({});   // {id: ligCode} ligando a evaluar
 
   /* ── Cargar NGL ── */
   useEffect(()=>{
@@ -393,6 +542,33 @@ export default function App() {
     const m=parseFloat(sc.castp?.msVol);if(!isNaN(m)){s+=Math.min(m/1000,1)*0.2;w+=0.2;}
     return w>0?(s/w).toFixed(3):null;
   },[scores]);
+
+  /* ── Cargar validación cristalográfica (Nivel 1 + 2) ── */
+  const loadValidation = useCallback(async (id, ligCode) => {
+    setValLoad(p=>({...p,[id]:true}));
+    try {
+      const [global, ligand] = await Promise.all([
+        fetchGlobalQuality(id),
+        ligCode ? fetchLigandQuality(id, ligCode) : Promise.resolve(null),
+      ]);
+      setValData(p=>({...p,[id]:{global, ligand, ligCode}}));
+    } catch(e) {
+      setValData(p=>({...p,[id]:{global:null, ligand:null, error:e.message}}));
+    } finally {
+      setValLoad(p=>({...p,[id]:false}));
+    }
+  },[]);
+
+  // Cargar validación de todas las estructuras seleccionadas (en serie para no saturar la API)
+  const loadAllValidation = useCallback(async () => {
+    for (const id of [...selected]) {
+      const lig = valLigSel[id] || getLigs(entries[id]||{})[0] || null;
+      await loadValidation(id, lig);
+    }
+  },[selected, valLigSel, entries, loadValidation]);
+
+  const setGninaVal = (id, field, value) =>
+    setGnina(p=>({...p,[id]:{...(p[id]||{}), [field]: value===""?null:parseFloat(value)}}));
 
   /* ── Búsqueda texto ── */
   const doSearch=useCallback(async()=>{
@@ -494,7 +670,7 @@ export default function App() {
 
   const TABS=[
     {id:"search",  l:"Búsqueda PDB"},
-    {id:"analysis",l:`Druggability${selArr.length?` (${selArr.length})`:""}`},
+    {id:"analysis",l:`Selección de Receptor${selArr.length?` (${selArr.length})`:""}`},
     {id:"download", l:"Descarga"},
     {id:"inter",   l:"Interacciones"},
     {id:"ai",      l:"Asesoría IA"},
@@ -686,33 +862,230 @@ export default function App() {
           {!selArr.length
             ?<div style={{...card,textAlign:"center",padding:"2rem",color:C.txd}}><div style={{fontSize:28,opacity:.1,marginBottom:8}}>◈</div>Selecciona estructuras en Búsqueda primero.</div>
             :<>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:10,marginBottom:12}}>
-                {TOOLS.map(tool=>(
-                  <div key={tool.id} style={{...card,borderColor:tool.col+"44"}}>
-                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}><Badge col={tool.col}>{tool.badge}</Badge><span style={{fontWeight:700,fontSize:14,color:tool.col}}>{tool.name}</span></div>
-                    <p style={{fontSize:11,color:C.txd,margin:"0 0 8px",lineHeight:1.5}}>{tool.hint}</p>
-                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                      {selArr.map(id=><a key={id} href={tool.url(id)} target="_blank" rel="noreferrer"
-                        style={{background:tool.col+"18",border:`1px solid ${tool.col}44`,color:tool.col,borderRadius:6,padding:"2px 10px",fontSize:11,fontWeight:600,textDecoration:"none"}}>{id} →</a>)}
+              {/* Encabezado + acción de carga */}
+              <div style={{...card,marginBottom:12,borderColor:C.c1+"44"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
+                  <div style={{flex:1,minWidth:240}}>
+                    <div style={{fontWeight:700,fontSize:15,color:C.c1,marginBottom:3}}>Selección de Receptor para Docking</div>
+                    <div style={{fontSize:11,color:C.txd,lineHeight:1.6}}>
+                      Evaluación jerárquica de calidad. La resolución es <em>cantidad</em>, no calidad
+                      (Warren et al. 2012); los criterios decisivos son R-free, el ajuste local del
+                      ligando (RSCC/RSR) y la validación funcional por GNINA (Domínguez-Ramírez et al. 2025).
                     </div>
                   </div>
-                ))}
+                  <Btn col={C.c2} onClick={loadAllValidation}>
+                    ⬇ Cargar métricas de validación
+                  </Btn>
+                </div>
               </div>
-              <div style={card}>
-                <div style={{fontWeight:700,fontSize:15,color:C.c1,marginBottom:2}}>Tabla Comparativa de Druggability</div>
-                <div style={{fontSize:11,color:C.txd,marginBottom:10}}>Ingresa los valores obtenidos de cada herramienta</div>
+
+              {/* Tabla jerárquica de selección */}
+              <div style={{...card,marginBottom:12}}>
+                <div style={{overflowX:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse"}}>
+                    <thead>
+                      <tr>
+                        <th style={{...TH,minWidth:62}}>PDB</th>
+                        <th style={{...TH,minWidth:70}}>Ligando</th>
+                        <th style={{...TH,minWidth:52,color:C.txd}} title="Cantidad, no calidad">Res. (Å)</th>
+                        <th style={{...TH,minWidth:60,color:C.c1}} title="R-free < 0.45; idealmente bajo">R-free</th>
+                        <th style={{...TH,minWidth:70,color:C.c1}} title="R-free − R-work ≤ 0.05">ΔR (free−work)</th>
+                        <th style={{...TH,minWidth:66,color:C.c3}} title="RSCC > 0.9 bueno · 0.8–0.9 dudoso · < 0.8 malo">RSCC lig.</th>
+                        <th style={{...TH,minWidth:60,color:C.c3}} title="RSR > 0.4 = bandera">RSR lig.</th>
+                        <th style={{...TH,minWidth:78,color:C.c4}} title="CNN score del re-docking del co-cristal (≥ 0.9)">CNN score</th>
+                        <th style={{...TH,minWidth:62,color:C.c4}} title="RMSD del re-docking (apoyo)">RMSD</th>
+                        <th style={{...TH,minWidth:108}}>Veredicto</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selArr.map(id=>{
+                        const e=entries[id];
+                        const ligs=getLigs(e);
+                        const lig=valLigSel[id]||ligs[0]||"";
+                        const vd=valData[id];
+                        const q=vd?.global, lq=vd?.ligand;
+                        const g=gnina[id];
+                        const verdict=receptorVerdict(q, lq, g);
+                        const loading=valLoad[id];
+                        const dR=(q?.rfree!=null&&q?.rwork!=null)?(q.rfree-q.rwork):null;
+                        return (
+                          <tr key={id}>
+                            <td style={{...TD,fontFamily:mono,color:C.c1,fontWeight:700,fontSize:12}}>{id}</td>
+                            <td style={TD}>
+                              {ligs.length>1
+                                ?<select value={lig} onChange={ev=>setValLigSel(p=>({...p,[id]:ev.target.value}))}
+                                  style={{...inp,maxWidth:74,padding:"2px 4px",fontSize:11}}>
+                                  {ligs.map(l=><option key={l} value={l}>{l}</option>)}
+                                </select>
+                                :<Badge col={C.c3}>{lig||"—"}</Badge>}
+                            </td>
+                            <td style={{...TD,fontFamily:mono,fontSize:11,color:C.txd}}>
+                              {loading?<Spin s={11}/>:q?.resolution!=null?q.resolution.toFixed(2):"—"}
+                            </td>
+                            <td style={{...TD,fontFamily:mono,fontSize:12,fontWeight:700,
+                              color:q?.rfree==null?C.txm:q.rfree>0.45?C.c5:q.rfree>0.28?C.c3:C.c2}}>
+                              {q?.rfree!=null?q.rfree.toFixed(3):"—"}
+                            </td>
+                            <td style={{...TD,fontFamily:mono,fontSize:12,fontWeight:700,
+                              color:dR==null?C.txm:dR>0.05?C.c5:C.c2}}>
+                              {dR!=null?dR.toFixed(3):"—"}
+                            </td>
+                            <td style={{...TD,fontFamily:mono,fontSize:12,fontWeight:700,
+                              color:lq?.rscc==null?C.txm:lq.rscc<0.8?C.c5:lq.rscc<0.9?C.c3:C.c2}}>
+                              {lq?.rscc!=null?lq.rscc.toFixed(2):lq?.hasData?"n/d":"—"}
+                            </td>
+                            <td style={{...TD,fontFamily:mono,fontSize:12,fontWeight:700,
+                              color:lq?.rsr==null?C.txm:lq.rsr>0.4?C.c5:C.c2}}>
+                              {lq?.rsr!=null?lq.rsr.toFixed(2):"—"}
+                            </td>
+                            <td style={TD}>
+                              <input type="number" step="0.01" min="0" max="1"
+                                value={g?.cnn??""} placeholder="—"
+                                onChange={ev=>setGninaVal(id,"cnn",ev.target.value)}
+                                style={{...inp,width:64,padding:"3px 6px",fontSize:11,
+                                  borderColor:g?.cnn!=null?(g.cnn>=0.9?C.c2:g.cnn>=0.5?C.c3:C.c5)+"77":C.bd,
+                                  color:g?.cnn!=null?(g.cnn>=0.9?C.c2:g.cnn>=0.5?C.c3:C.c5):C.tx}}/>
+                            </td>
+                            <td style={TD}>
+                              <input type="number" step="0.1" min="0"
+                                value={g?.rmsd??""} placeholder="Å"
+                                onChange={ev=>setGninaVal(id,"rmsd",ev.target.value)}
+                                style={{...inp,width:54,padding:"3px 6px",fontSize:11}}/>
+                            </td>
+                            <td style={TD}>
+                              <div style={{display:"flex",alignItems:"center",gap:5}}>
+                                <span style={{display:"inline-block",width:9,height:9,borderRadius:"50%",
+                                  background:tierColor(verdict.tier),flexShrink:0}}/>
+                                <span style={{fontSize:11,fontWeight:700,color:tierColor(verdict.tier)}}>
+                                  {tierLabel(verdict.tier)}
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{fontSize:10,color:C.txm,marginTop:8,lineHeight:1.6}}>
+                  <strong style={{color:C.txd}}>Jerarquía:</strong> una estructura no puede ser óptima si falla el Nivel 1
+                  (R-free &gt; 0.45) o el Nivel 2 (RSCC &lt; 0.8), por muy alto que sea su CNN score.
+                  Las métricas cristalográficas se obtienen automáticamente del wwPDB/PDBe; CNN score y RMSD se ingresan tras correr GNINA.
+                </div>
+              </div>
+
+              {/* Detalle de banderas por estructura */}
+              {selArr.some(id=>valData[id]) && (
+                <div style={{...card,marginBottom:12}}>
+                  <div style={{fontWeight:700,fontSize:13,color:C.c1,marginBottom:8}}>Diagnóstico por estructura</div>
+                  {selArr.filter(id=>valData[id]).map(id=>{
+                    const vd=valData[id], verdict=receptorVerdict(vd.global, vd.ligand, gnina[id]);
+                    return (
+                      <div key={id} style={{padding:"8px 0",borderBottom:`1px solid ${C.bd}22`}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                          <span style={{fontFamily:mono,color:C.c1,fontWeight:700,fontSize:12}}>{id}</span>
+                          <span style={{fontSize:11,fontWeight:700,color:tierColor(verdict.tier)}}>{tierLabel(verdict.tier)}</span>
+                          {vd.global?.hasSF===false&&<Badge col={C.c5}>sin factores de estructura</Badge>}
+                        </div>
+                        {verdict.flags.length===0
+                          ?<div style={{fontSize:11,color:C.c2}}>✓ Sin banderas cristalográficas. Estructura confiable para docking.</div>
+                          :<div style={{display:"flex",flexDirection:"column",gap:2}}>
+                            {verdict.flags.map((f,i)=>(
+                              <div key={i} style={{fontSize:11,color:tierColor(f.sev==="reject"?"reject":"caution"),display:"flex",gap:5}}>
+                                <span>{f.sev==="reject"?"✕":"⚠"}</span>{f.lvl}
+                              </div>
+                            ))}
+                          </div>}
+                        {verdict.cnnNote&&<div style={{fontSize:11,color:C.c4,marginTop:3}}>✦ {verdict.cnnNote}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Generador de comando GNINA */}
+              <div style={{...card,marginBottom:12,borderColor:C.c4+"44"}}>
+                <div style={{fontWeight:700,fontSize:13,color:C.c4,marginBottom:6}}>Comando GNINA — re-docking del co-cristal</div>
+                <div style={{fontSize:11,color:C.txd,marginBottom:8,lineHeight:1.6}}>
+                  Para validar cada receptor, re-dockea su ligando co-cristalizado y registra el CNN score arriba.
+                  El umbral de "docking de alta calidad" es CNN ≥ 0.9 (Domínguez-Ramírez et al. 2025).
+                </div>
+                {selArr.map(id=>{
+                  const lig=valLigSel[id]||getLigs(entries[id]||{})[0]||"LIG";
+                  return (
+                    <div key={id} style={{marginBottom:6}}>
+                      <div style={{fontFamily:mono,background:C.bg,borderRadius:6,padding:"6px 9px",
+                        border:`1px solid ${C.bd}`,fontSize:10.5,color:C.c2,overflowX:"auto",whiteSpace:"nowrap"}}>
+                        gnina -r {id}_protein_clean.pdb -l {id}_{lig}.pdb --autobox_ligand {id}_{lig}.pdb --cnn_scoring rescore -o {id}_redock.sdf.gz
+                      </div>
+                    </div>
+                  );
+                })}
+                <div style={{fontSize:10,color:C.txm,marginTop:4}}>
+                  Descarga proteína y ligando desde la pestaña Descarga. <code>--autobox_ligand</code> define la caja a partir del co-cristal.
+                </div>
+              </div>
+
+              {/* Ranking combinado */}
+              {selArr.some(id=>valData[id]||gnina[id]) && (
+                <div style={{...card,marginBottom:12,borderColor:C.c2+"44"}}>
+                  <div style={{fontWeight:700,color:C.c2,marginBottom:8,fontSize:13}}>◆ Ranking de receptores</div>
+                  {selArr
+                    .map(id=>({id, v:receptorVerdict(valData[id]?.global, valData[id]?.ligand, gnina[id]), g:gnina[id], lq:valData[id]?.ligand}))
+                    .sort((a,b)=>{
+                      const ord={ok:0,caution:1,unknown:2,reject:3};
+                      if(ord[a.v.tier]!==ord[b.v.tier]) return ord[a.v.tier]-ord[b.v.tier];
+                      const ca=a.g?.cnn??-1, cb=b.g?.cnn??-1;
+                      if(cb!==ca) return cb-ca;
+                      const ra=a.lq?.rscc??-1, rb=b.lq?.rscc??-1;
+                      return rb-ra;
+                    })
+                    .map(({id,v,g,lq},i)=>(
+                      <div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0",borderBottom:`1px solid ${C.bd}22`}}>
+                        <Badge col={i===0?C.c2:i===1?C.c3:C.txd}>#{i+1}</Badge>
+                        <span style={{fontFamily:mono,color:C.c1,fontWeight:700,fontSize:12}}>{id}</span>
+                        <span style={{fontSize:11,color:C.txd,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{entries[id]?.struct?.title||""}</span>
+                        {lq?.rscc!=null&&<span style={{fontFamily:mono,fontSize:10,color:lq.rscc<0.8?C.c5:lq.rscc<0.9?C.c3:C.c2}}>RSCC {lq.rscc.toFixed(2)}</span>}
+                        {g?.cnn!=null&&<span style={{fontFamily:mono,fontSize:10,color:g.cnn>=0.9?C.c2:g.cnn>=0.5?C.c3:C.c5}}>CNN {g.cnn.toFixed(2)}</span>}
+                        <span style={{fontSize:11,fontWeight:700,color:tierColor(v.tier)}}>{tierLabel(v.tier)}</span>
+                        <Btn col={C.c4} ghost small onClick={()=>doAI(id)}>✦ IA</Btn>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {/* Druggability — ahora complementaria */}
+              <details style={{...card}}>
+                <summary style={{cursor:"pointer",fontWeight:700,fontSize:13,color:C.txd,userSelect:"none"}}>
+                  Druggability del bolsillo (criterio complementario)
+                </summary>
+                <div style={{fontSize:11,color:C.txm,margin:"6px 0 12px",lineHeight:1.6}}>
+                  La druggability evalúa la cavidad de forma ligand-agnóstica. Útil como triage inicial,
+                  pero subordinada a la calidad cristalográfica y la validación funcional de arriba.
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:10,marginBottom:12}}>
+                  {TOOLS.map(tool=>(
+                    <div key={tool.id} style={{...card,borderColor:tool.col+"44"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}><Badge col={tool.col}>{tool.badge}</Badge><span style={{fontWeight:700,fontSize:14,color:tool.col}}>{tool.name}</span></div>
+                      <p style={{fontSize:11,color:C.txd,margin:"0 0 8px",lineHeight:1.5}}>{tool.hint}</p>
+                      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                        {selArr.map(id=><a key={id} href={tool.url(id)} target="_blank" rel="noreferrer"
+                          style={{background:tool.col+"18",border:`1px solid ${tool.col}44`,color:tool.col,borderRadius:6,padding:"2px 10px",fontSize:11,fontWeight:600,textDecoration:"none"}}>{id} →</a>)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
                 <div style={{overflowX:"auto"}}>
                   <table style={{width:"100%",borderCollapse:"collapse"}}>
                     <thead><tr>
-                      <th style={{...TH,minWidth:70}}>PDB ID</th><th style={{...TH,minWidth:55}}>Res.</th>
+                      <th style={{...TH,minWidth:70}}>PDB ID</th>
                       {TOOLS.map(tool=>tool.fields.map(f=><th key={`${tool.id}-${f.k}`} style={{...TH,color:tool.col,minWidth:80}}>{tool.badge}: {f.l}</th>))}
                       <th style={{...TH,minWidth:85,color:C.c4}}>Score Global</th>
                     </tr></thead>
                     <tbody>{selArr.map(id=>{
-                      const e=entries[id],ov=overall(id);
+                      const ov=overall(id);
                       return(<tr key={id}>
                         <td style={{...TD,fontFamily:mono,color:C.c1,fontWeight:700,fontSize:12}}>{id}</td>
-                        <td style={{...TD,fontFamily:mono,fontSize:11}}>{getRes(e)}</td>
                         {TOOLS.map(tool=>tool.fields.map(f=>{
                           const val=(scores[id]?.[tool.id]?.[f.k])||"";
                           return(<td key={`${tool.id}-${f.k}`} style={TD}>
@@ -733,21 +1106,7 @@ export default function App() {
                   </table>
                 </div>
                 <div style={{fontSize:10,color:C.txm,marginTop:6}}>Score = DOG×0.4 + FPW×0.4 + CASTp_msVol_norm×0.2 · Verde ≥ 0.7 · Amarillo ≥ 0.5 · Rojo &lt; 0.5</div>
-              </div>
-              {selArr.some(id=>overall(id)!=null)&&(
-                <div style={{...card,marginTop:10,borderColor:C.c4+"44"}}>
-                  <div style={{fontWeight:700,color:C.c4,marginBottom:8,fontSize:13}}>◆ Ranking por druggabilidad</div>
-                  {selArr.filter(id=>overall(id)!=null).sort((a,b)=>parseFloat(overall(b))-parseFloat(overall(a))).map((id,i)=>(
-                    <div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 0",borderBottom:`1px solid ${C.bd}22`}}>
-                      <Badge col={i===0?C.c2:i===1?C.c3:C.c5}>#{i+1}</Badge>
-                      <span style={{fontFamily:mono,color:C.c1,fontWeight:700,fontSize:12}}>{id}</span>
-                      <span style={{fontSize:11,color:C.txd,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{entries[id]?.struct?.title||""}</span>
-                      <span style={{fontFamily:mono,fontWeight:700,color:scoreCol(overall(id))}}>{overall(id)}</span>
-                      <Btn col={C.c4} ghost small onClick={()=>doAI(id)}>✦ IA</Btn>
-                    </div>
-                  ))}
-                </div>
-              )}
+              </details>
             </>}
         </div>
       )}
