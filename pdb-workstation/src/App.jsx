@@ -122,7 +122,7 @@ const fetchDetails = async ids => {
    La resolución es CANTIDAD, no calidad. Los criterios decisivos son
    R-free, error de coordenadas, y el ajuste local del ligando (RSCC/RSR).
 ═══════════════════════════════════════════════════════════ */
-const PDBE = "https://www.ebi.ac.uk/pdbe/api";
+const PDBE = "https://www.ebi.ac.uk/pdbe/api"; // (reservado para futuras métricas locales)
 
 // Promise con timeout para que un endpoint lento no congele la app
 const fetchJSON = async (url, ms=12000) => {
@@ -136,82 +136,89 @@ const fetchJSON = async (url, ms=12000) => {
   } catch { clearTimeout(t); return null; }
 };
 
-/* Nivel 1 — Calidad global del modelo (R-free, R-work, resolución, factores de estructura) */
+/* Nivel 1 — Calidad global del modelo (R-free, R-work, resolución).
+   Fuente primaria: RCSB Data API (objeto `refine` del entry), que es CORS-friendly
+   y ya funciona desde el navegador. Los campos siguen el diccionario PDBx/mmCIF. */
 const fetchGlobalQuality = async id => {
-  const lid = id.toLowerCase();
-  const out = {rfree:null, rwork:null, resolution:null, hasSF:null, pctRfree:null, pctClash:null};
-  // Estadísticas de refinamiento (R-free, R-work, resolución)
-  const stats = await fetchJSON(`${PDBE}/validation/xray_refine_data_stats/entry/${lid}`);
-  const s = stats?.[lid]?.[0];
-  if (s) {
-    out.rfree      = s.R_free!=null ? parseFloat(s.R_free) : null;
-    out.rwork      = s.R_work!=null ? parseFloat(s.R_work) : (s.R_factor!=null?parseFloat(s.R_factor):null);
-    out.resolution = s.resolution!=null ? parseFloat(s.resolution) : null;
+  const out = {rfree:null, rwork:null, resolution:null, hasSF:null, clashscore:null,
+               ramaOutliers:null, pctRfree:null};
+  const j = await fetchJSON(`https://data.rcsb.org/rest/v1/core/entry/${id.toUpperCase()}`);
+  if (!j) return out;
+
+  // Datos de refinamiento: refine es un arreglo
+  const ref = Array.isArray(j.refine) ? j.refine[0] : j.refine;
+  if (ref) {
+    out.rfree = ref.ls_r_factor_r_free!=null ? parseFloat(ref.ls_r_factor_r_free) : null;
+    out.rwork = ref.ls_r_factor_r_work!=null ? parseFloat(ref.ls_r_factor_r_work)
+              : (ref.ls_r_factor_obs!=null ? parseFloat(ref.ls_r_factor_obs) : null);
   }
-  // Percentiles globales (calidad relativa al archivo)
-  const glob = await fetchJSON(`${PDBE}/validation/global-percentiles/entry/${lid}`);
-  const g = glob?.[lid];
-  if (g) {
-    out.pctRfree = g.percentiles?.Rfree ?? g.Rfree ?? null;
-    out.pctClash = g.percentiles?.clashscore ?? g.clashscore ?? null;
-  }
-  // ¿Hay factores de estructura? (RCSB entry endpoint)
-  const ent = await fetchJSON(`https://data.rcsb.org/rest/v1/core/entry/${id}`);
-  if (ent) {
-    const sf = ent?.rcsb_entry_info?.experimental_method_details
-            ?? ent?.pdbx_database_status?.status_code_sf;
-    out.hasSF = ent?.rcsb_entry_info?.diffrn_resolution_high?.value!=null
-              || ent?.pdbx_database_status?.status_code_sf==="REL"
-              || null;
-    if (out.resolution==null) out.resolution = ent?.rcsb_entry_info?.resolution_combined?.[0] ?? null;
+
+  // Resolución: varios caminos posibles
+  out.resolution = j.rcsb_entry_info?.resolution_combined?.[0]
+                ?? (Array.isArray(j.refine) ? j.refine[0]?.ls_d_res_high : null)
+                ?? j.rcsb_entry_info?.diffrn_resolution_high?.value
+                ?? null;
+  if (out.resolution!=null) out.resolution = parseFloat(out.resolution);
+
+  // ¿Factores de estructura depositados?
+  out.hasSF = j.rcsb_entry_info?.deposited_structure_factor_count > 0
+           || j.pdbx_database_status?.status_code_sf === "REL"
+           || null;
+
+  // Métricas de validación global (clashscore, Ramachandran) si están integradas
+  const pq = j.pdbx_vrpt_summary || j.rcsb_entry_info;
+  if (j.pdbx_vrpt_summary) {
+    out.clashscore  = j.pdbx_vrpt_summary.clashscore ?? null;
+    out.pctRfree    = j.pdbx_vrpt_summary.absolute_percentile_percent_rama_outliers ?? null;
   }
   return out;
 };
 
-/* Nivel 2 — Calidad local del ligando co-cristalizado (RSCC, RSR, geometría)
-   Endpoint de outliers: marca ligandos con RSR>0.4 o RSCC<0.8 (criterio wwPDB actual). */
+/* Nivel 2 — Calidad local del ligando co-cristalizado (RSCC, RSR).
+   Fuente: RCSB Data API. Primero se listan las instancias non-polymer del entry,
+   luego se consulta el score de validación de cada una y se queda con la del ligando pedido.
+   El campo rcsb_nonpolymer_instance_validation_score trae RSCC, RSR y ranking. */
 const fetchLigandQuality = async (id, ligCode) => {
-  const lid = id.toLowerCase();
-  const out = {rscc:null, rsr:null, flagged:false, hasData:false, geomOutliers:0};
-  // El endpoint key_validation_stats / outliers trae density-fit por residuo
-  const data = await fetchJSON(`${PDBE}/validation/protein-RNA-DNA-geometry-outlier-residues/entry/${lid}`);
-  // Density fit de ligandos
-  const dens = await fetchJSON(`${PDBE}/validation/RNA_pucker_suite_outliers/entry/${lid}`); // fallback dummy
-  // Endpoint principal de outliers de todos los tipos:
-  const all = await fetchJSON(`${PDBE}/validation/outliers/all/${lid}`);
-  if (all?.[lid]) {
-    out.hasData = true;
-    const mols = all[lid].molecules || [];
-    for (const mol of mols) {
-      for (const ch of (mol.chains||[])) {
-        for (const res of (ch.models?.[0]?.residues || ch.residues || [])) {
-          if (res.residue_name===ligCode || res.chem_comp_id===ligCode) {
-            // density-fit outliers traen RSCC/RSR cuando existen
-            const ol = res.outlier_types || [];
-            if (res.RSCC!=null) out.rscc = parseFloat(res.RSCC);
-            if (res.RSR!=null)  out.rsr  = parseFloat(res.RSR);
-            out.geomOutliers += (res.geometry_outlier_count ?? ol.filter(t=>/bond|angle|chir|clash/i.test(t)).length);
-            if (ol.some(t=>/density|RSRZ|RSCC/i.test(t))) out.flagged = true;
-          }
-        }
-      }
-    }
-  }
-  // Fallback: score de calidad de ligando del RCSB (PC1-fitting, agregado RSR+RSCC)
-  if (out.rscc==null) {
-    const lq = await fetchJSON(`https://data.rcsb.org/rest/v1/core/nonpolymer_entity_instance/${id}/A`);
-    const val = lq?.rcsb_nonpolymer_instance_validation_score?.[0];
-    if (val) {
+  const ID = id.toUpperCase();
+  const out = {rscc:null, rsr:null, rsrz:null, bfactor:null, occupancy:null,
+               flagged:false, hasData:false, ranking:null, intermolClashes:null};
+
+  // 1. Listar instancias non-polymer (ligandos) del entry
+  const entry = await fetchJSON(`https://data.rcsb.org/rest/v1/core/entry/${ID}`);
+  const instanceIds = entry?.rcsb_entry_container_identifiers?.non_polymer_entity_instance_ids
+                   || entry?.rcsb_entry_container_identifiers?.nonpolymer_entity_instance_ids
+                   || [];
+
+  // 2. Para cada instancia, traer su validación y comprobar si es el ligando buscado
+  for (const asymId of instanceIds) {
+    const inst = await fetchJSON(`https://data.rcsb.org/rest/v1/core/nonpolymer_entity_instance/${ID}/${asymId}`);
+    if (!inst) continue;
+    // Identidad del compuesto en esta instancia
+    const comp = inst?.rcsb_nonpolymer_entity_instance_container_identifiers?.comp_id
+              || inst?.pdbx_struct_special_symmetry?.[0]?.label_comp_id
+              || null;
+    if (comp && comp !== ligCode) continue;
+
+    // Score de validación: puede venir como arreglo
+    const vs = inst?.rcsb_nonpolymer_instance_validation_score;
+    const v = Array.isArray(vs) ? vs[0] : vs;
+    if (v) {
       out.hasData = true;
-      if (val.RSCC!=null) out.rscc = parseFloat(val.RSCC);
-      if (val.RSR!=null)  out.rsr  = parseFloat(val.RSR);
-      if (val.is_subject_of_investigation!=null) {} // info extra
-      out.ranking = val.ranking_model_fit ?? null;
+      if (v.RSCC!=null)               out.rscc = parseFloat(v.RSCC);
+      if (v.RSR!=null)                out.rsr  = parseFloat(v.RSR);
+      if (v.RSRZ!=null)               out.rsrz = parseFloat(v.RSRZ);
+      if (v.ranking_model_fit!=null)  out.ranking = parseFloat(v.ranking_model_fit);
+      if (v.average_occupancy!=null)  out.occupancy = parseFloat(v.average_occupancy);
+      if (v.intermolecular_clashes!=null) out.intermolClashes = v.intermolecular_clashes;
+      if (v.is_best_instance!=null) {} // info extra
+      // RSCC puede venir también como ranking; si no hay RSCC pero sí ranking, lo usamos como proxy informativo
     }
+    if (out.hasData) break; // encontrada la instancia del ligando
   }
-  // Bandera según criterio wwPDB actual: RSR>0.4 o RSCC<0.8
-  if (out.rsr!=null && out.rsr>0.4) out.flagged = true;
-  if (out.rscc!=null && out.rscc<0.8) out.flagged = true;
+
+  // 3. Bandera según criterio wwPDB actual: RSR > 0.4 o RSCC < 0.8
+  if (out.rsr!=null && out.rsr > 0.4)  out.flagged = true;
+  if (out.rscc!=null && out.rscc < 0.8) out.flagged = true;
   return out;
 };
 
@@ -551,7 +558,14 @@ export default function App() {
         fetchGlobalQuality(id),
         ligCode ? fetchLigandQuality(id, ligCode) : Promise.resolve(null),
       ]);
-      setValData(p=>({...p,[id]:{global, ligand, ligCode}}));
+      // Estado de diagnóstico: ¿llegó algo?
+      const status = {
+        globalOk: global && (global.rfree!=null || global.resolution!=null),
+        ligandOk: ligand && ligand.hasData,
+        rfreeOk:  global && global.rfree!=null,
+        rsccOk:   ligand && ligand.rscc!=null,
+      };
+      setValData(p=>({...p,[id]:{global, ligand, ligCode, status}}));
     } catch(e) {
       setValData(p=>({...p,[id]:{global:null, ligand:null, error:e.message}}));
     } finally {
@@ -997,6 +1011,12 @@ export default function App() {
                             ))}
                           </div>}
                         {verdict.cnnNote&&<div style={{fontSize:11,color:C.c4,marginTop:3}}>✦ {verdict.cnnNote}</div>}
+                        {vd.ligand && !vd.ligand.hasData && (
+                          <div style={{fontSize:10.5,color:C.txm,marginTop:3,fontStyle:"italic"}}>
+                            Sin datos de RSCC/RSR para este ligando en el wwPDB (común si no hay factores de estructura,
+                            o si el ligando es ion/solvente). El veredicto se basa en las métricas globales disponibles.
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1023,6 +1043,17 @@ export default function App() {
                 })}
                 <div style={{fontSize:10,color:C.txm,marginTop:4}}>
                   Descarga proteína y ligando desde la pestaña Descarga. <code>--autobox_ligand</code> define la caja a partir del co-cristal.
+                </div>
+                <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.bd}`,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                  <span style={{fontSize:11,color:C.txd}}>¿Sin GNINA local?</span>
+                  <a href="https://nyelidl.github.io/anyone-docking/" target="_blank" rel="noreferrer"
+                    style={{background:C.c4+"18",border:`1px solid ${C.c4}55`,color:C.c4,borderRadius:7,
+                      padding:"5px 12px",fontSize:12,fontWeight:600,textDecoration:"none"}}>
+                    Anyone Can Dock (Colab) →
+                  </a>
+                  <span style={{fontSize:10,color:C.txm}}>
+                    Corre GNINA 1.3 en GPU gratuita de Colab, con re-docking del co-cristal y RMSD integrados.
+                  </span>
                 </div>
               </div>
 
