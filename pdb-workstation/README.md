@@ -2,7 +2,7 @@
 
 Herramienta web para búsqueda de estructuras en el RCSB PDB, análisis de druggability y preparación de archivos para docking molecular.
 
-Desarrollada en CICATA-IPN.
+Desarrollada en ESM-IPN.
 
 ---
 
