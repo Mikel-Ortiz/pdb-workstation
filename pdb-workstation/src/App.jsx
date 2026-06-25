@@ -94,20 +94,53 @@ const fetchDetails = async ids => {
     try {
       const r = await fetch(`https://data.rcsb.org/rest/v1/core/entry/${id}`);
       if (!r.ok) return {rcsb_id:id};
-      const j = await r.json();
-      // Try to get organism from polymer entities separately
+      const txt = await r.text();
+      if (!txt.trim()) return {rcsb_id:id};
+      const j = JSON.parse(txt);
+
+      // Organismo desde la primera entidad polímero
       let organism = null;
       try {
         const re = await fetch(`https://data.rcsb.org/rest/v1/core/polymer_entity/${id}/1`);
         if (re.ok) {
-          const je = await re.json();
-          organism = je?.rcsb_entity_source_organism?.[0]?.ncbi_scientific_name || null;
+          const jt = await re.text();
+          if (jt.trim()) {
+            const je = JSON.parse(jt);
+            organism = je?.rcsb_entity_source_organism?.[0]?.ncbi_scientific_name || null;
+          }
         }
       } catch {}
+
+      // Ligandos: el campo agregado nonpolymer_bound_components es la fuente principal,
+      // pero no siempre está poblado. Como respaldo, resolver los comp_id de cada
+      // entidad non-polymer del entry.
+      let ligands = j.rcsb_entry_info?.nonpolymer_bound_components || [];
+      if (!ligands.length) {
+        const npIds = j.rcsb_entry_container_identifiers?.non_polymer_entity_ids || [];
+        if (npIds.length) {
+          const comps = await Promise.all(npIds.map(async eid => {
+            try {
+              const er = await fetch(`https://data.rcsb.org/rest/v1/core/nonpolymer_entity/${id}/${eid}`);
+              if (!er.ok) return null;
+              const et = await er.text();
+              if (!et.trim()) return null;
+              const ej = JSON.parse(et);
+              return ej?.pdbx_entity_nonpoly?.comp_id
+                  || ej?.rcsb_nonpolymer_entity_container_identifiers?.nonpolymer_comp_id?.[0]
+                  || null;
+            } catch { return null; }
+          }));
+          ligands = comps.filter(Boolean);
+        }
+      }
+
+      // Inyectar los ligandos resueltos en rcsb_entry_info para que getLigs los lea
+      const info = {...(j.rcsb_entry_info||{}), nonpolymer_bound_components: ligands};
+
       return {
         rcsb_id: id,
         struct: j.struct,
-        rcsb_entry_info: j.rcsb_entry_info,
+        rcsb_entry_info: info,
         exptl: j.exptl,
         polymer_entities: organism ? [{rcsb_entity_source_organism:[{ncbi_scientific_name:organism}]}] : [],
       };
@@ -131,8 +164,10 @@ const fetchJSON = async (url, ms=12000) => {
   try {
     const r = await fetch(url, {signal:ctrl.signal});
     clearTimeout(t);
-    if (!r.ok) return null;
-    return await r.json();
+    if (!r.ok || r.status===204) return null;
+    const txt = await r.text();
+    if (!txt.trim()) return null;
+    return JSON.parse(txt);
   } catch { clearTimeout(t); return null; }
 };
 
@@ -623,8 +658,11 @@ export default function App() {
     try{
       const url=`${RCSB.search}?json=${encodeURIComponent(JSON.stringify(buildTextQuery(query,filters)))}`;
       const r=await fetch(url);
+      if(r.status===204){setError("Sin resultados. Prueba términos más generales o relaja los filtros.");return;}
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j=await r.json();
+      const txt=await r.text();
+      if(!txt.trim()){setError("Sin resultados. Prueba términos más generales o relaja los filtros.");return;}
+      const j=JSON.parse(txt);
       const ids=(j.result_set||[]).map(x=>x.identifier);
       if(!ids.length){setError("Sin resultados. Prueba términos más generales.");return;}
       const det=await fetchDetails(ids);
@@ -641,8 +679,11 @@ export default function App() {
     try{
       const url=`${RCSB.search}?json=${encodeURIComponent(JSON.stringify(buildUniprotQuery(uniprotQ,filters)))}`;
       const r=await fetch(url);
+      if(r.status===204){setError(`Sin estructuras en el PDB para ${uniprotQ.toUpperCase()} con los filtros actuales. Relaja la resolución o la técnica.`);return;}
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j=await r.json();
+      const txt=await r.text();
+      if(!txt.trim()){setError(`Sin estructuras en el PDB para ${uniprotQ.toUpperCase()} con los filtros actuales. Relaja la resolución o la técnica.`);return;}
+      const j=JSON.parse(txt);
       // IDs vienen como "4ZUD_1" (entity); recortar a entry y deduplicar.
       const ids=[...new Set((j.result_set||[]).map(x=>x.identifier.split("_")[0]))];
       if(!ids.length){setError("Sin resultados para ese acceso UniProt.");return;}
