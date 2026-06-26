@@ -825,7 +825,7 @@ export default function App() {
       <div style={{background:C.s1,borderBottom:`1px solid ${C.bd}`,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
         <div>
           <div style={{fontSize:17,fontWeight:700,color:C.c1,letterSpacing:"0.04em"}}>PDB Drug Discovery Workstation</div>
-          <div style={{fontSize:10,color:C.txm,letterSpacing:"0.07em"}}>RCSB · DRUGGABILITY · INTERACCIONES · DOCKING IA</div>
+          <div style={{fontSize:10,color:C.txm,letterSpacing:"0.07em"}}>RCSB · BEST PDB FOR DOCKING SELECTION · INTERACCIONES · DOCKING IA</div>
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
           {selArr.slice(0,5).map(id=><Badge key={id} col={C.c1}>{id}</Badge>)}
