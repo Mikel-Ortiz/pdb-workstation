@@ -650,6 +650,59 @@ export default function App() {
   const setGninaVal = (id, field, value) =>
     setGnina(p=>({...p,[id]:{...(p[id]||{}), [field]: value===""?null:parseFloat(value)}}));
 
+  /* ── Importar resultados GNINA desde el CSV del cuaderno de Colab ── */
+  const [importMsg, setImportMsg] = useState("");
+  const importGninaCSV = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const text = String(ev.target.result || "");
+        const lines = text.split(/\r?\n/).filter(l => l.trim());
+        if (!lines.length) { setImportMsg("El archivo está vacío."); return; }
+        // Parsear cabecera (tolerante a comas dentro de comillas no esperadas)
+        const header = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g,""));
+        const idx = name => header.findIndex(h => h.toLowerCase() === name.toLowerCase());
+        const iPDB  = idx("PDB");
+        const iCNN  = idx("CNN score");
+        const iRMSD = header.findIndex(h => /rmsd/i.test(h));
+        if (iPDB < 0 || iCNN < 0) {
+          setImportMsg("No reconozco las columnas. Esperado: PDB, CNN score, RMSD (Å). ¿Es el CSV del cuaderno GNINA?");
+          return;
+        }
+        let matched = 0, unmatched = [];
+        const upper = selArr.map(s => s.toUpperCase());
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i].split(",").map(c => c.trim().replace(/^"|"$/g,""));
+          const pdb = (cols[iPDB]||"").toUpperCase();
+          if (!pdb) continue;
+          const cnn  = parseFloat(cols[iCNN]);
+          const rmsd = iRMSD>=0 ? parseFloat(cols[iRMSD]) : NaN;
+          // Emparejar con una estructura seleccionada (case-insensitive)
+          const target = selArr.find(s => s.toUpperCase() === pdb);
+          if (target) {
+            setGnina(p => ({...p, [target]: {
+              ...(p[target]||{}),
+              cnn:  isNaN(cnn)  ? (p[target]?.cnn ?? null)  : cnn,
+              rmsd: isNaN(rmsd) ? (p[target]?.rmsd ?? null) : rmsd,
+            }}));
+            matched++;
+          } else {
+            unmatched.push(pdb);
+          }
+        }
+        let msg = `${matched} estructura(s) actualizada(s) con CNN score y RMSD.`;
+        if (unmatched.length) msg += ` No seleccionadas (omitidas): ${[...new Set(unmatched)].join(", ")}.`;
+        if (!matched) msg = `Ninguna fila del CSV coincide con tus estructuras seleccionadas (${selArr.join(", ")||"ninguna"}). Selecciónalas en Búsqueda primero.`;
+        setImportMsg(msg);
+      } catch (e) {
+        setImportMsg("Error al leer el CSV: " + e.message);
+      }
+    };
+    reader.onerror = () => setImportMsg("No se pudo leer el archivo.");
+    reader.readAsText(file);
+  };
+
   /* ── Búsqueda texto ── */
   const doSearch=useCallback(async()=>{
     if(!query.trim()&&!filters.ligand&&!filters.species&&!filters.method&&!filters.maxRes)
@@ -959,10 +1012,25 @@ export default function App() {
                       ligando (RSCC/RSR) y la validación funcional por GNINA (Domínguez-Ramírez et al. 2025).
                     </div>
                   </div>
-                  <Btn col={C.c2} onClick={loadAllValidation}>
-                    ⬇ Cargar métricas de validación
-                  </Btn>
+                  <div style={{display:"flex",flexDirection:"column",gap:6,alignItems:"flex-end"}}>
+                    <Btn col={C.c2} onClick={loadAllValidation}>
+                      ⬇ Cargar métricas de validación
+                    </Btn>
+                    <label style={{background:C.c4+"18",border:`1px solid ${C.c4}55`,color:C.c4,
+                      borderRadius:7,padding:"6px 14px",fontSize:13,fontWeight:600,cursor:"pointer",
+                      display:"inline-flex",alignItems:"center",gap:6,whiteSpace:"nowrap"}}>
+                      ⬆ Importar CSV de GNINA
+                      <input type="file" accept=".csv,text/csv" style={{display:"none"}}
+                        onChange={ev=>{importGninaCSV(ev.target.files?.[0]); ev.target.value="";}}/>
+                    </label>
+                  </div>
                 </div>
+                {importMsg && (
+                  <div style={{marginTop:10,padding:"7px 10px",background:C.bg,borderRadius:6,
+                    borderLeft:`3px solid ${C.c4}`,fontSize:11,color:C.txd,lineHeight:1.5}}>
+                    {importMsg}
+                  </div>
+                )}
               </div>
 
               {/* Tabla jerárquica de selección */}
@@ -1133,7 +1201,7 @@ export default function App() {
                     ▶ Abrir cuaderno GNINA en Colab
                   </a>
                   <span style={{fontSize:10,color:C.txm}}>
-                    Re-dockea el co-cristal en GPU gratuita y devuelve CNN score y RMSD listos para copiar aquí.
+                    Re-dockea el co-cristal en GPU gratuita. Descarga el CSV que genera y súbelo con "Importar CSV de GNINA" arriba para llenar CNN score y RMSD automáticamente.
                   </span>
                 </div>
               </div>
